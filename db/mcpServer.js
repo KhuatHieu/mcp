@@ -12,6 +12,7 @@ class DatabaseConnection {
     if (!DriverClass)
       throw new Error(`Database type không được hỗ trợ: ${type}`);
     this.driver = new DriverClass(config);
+    this.type = type;
   }
 
   connect() {
@@ -19,6 +20,15 @@ class DatabaseConnection {
   }
   query(q) {
     return this.driver.query(q);
+  }
+  listTables() {
+    return this.driver.listTables();
+  }
+  describeTable(tableName) {
+    return this.driver.describeTable(tableName);
+  }
+  healthCheck() {
+    return this.driver.healthCheck();
   }
   close() {
     return this.driver.close();
@@ -44,6 +54,14 @@ const SQLSERVER_OPTIONS = {
   trustServerCertificate: true,
 };
 
+// Retry configuration
+const RETRY_CONFIG = {
+  maxRetries: 3,
+  initialDelayMs: 100,
+  maxDelayMs: 2000,
+  backoffMultiplier: 2,
+};
+
 export default class MultiDatabaseMCPServer {
   constructor() {
     this.server = new Server(
@@ -60,17 +78,34 @@ export default class MultiDatabaseMCPServer {
   }
 
   getConnectionKey(type, cfg) {
-    const host = cfg.host || cfg.server;
+    const host = cfg.host || cfg.server || "localhost";
+    const port = cfg.port || this.getDefaultPort(type);
     const db = cfg.database || "no_database";
     const user = cfg.user || "no_user";
-    return `${type}_${host}_${cfg.port}_${db}_${user}`;
+    const options = cfg.options ? JSON.stringify(cfg.options) : "{}";
+    return `${type}_${host}_${port}_${db}_${user}_${options}`;
   }
+
   async getConnection(type, cfg) {
     const key = this.getConnectionKey(type, cfg);
+
     if (!this.connections.has(key)) {
-      this.connections.set(key, new DatabaseConnection(type, cfg));
+      const conn = new DatabaseConnection(type, cfg);
+      this.connections.set(key, conn);
     }
+
     return this.connections.get(key);
+  }
+
+  // Remove stale connection from cache (for reconnect scenarios)
+  removeConnection(type, cfg) {
+    const key = this.getConnectionKey(type, cfg);
+    if (this.connections.has(key)) {
+      const conn = this.connections.get(key);
+      // Try to close gracefully
+      conn.close().catch(() => {});
+      this.connections.delete(key);
+    }
   }
 
   parseConnectionString(str, type) {
@@ -83,19 +118,19 @@ export default class MultiDatabaseMCPServer {
         password: url.password,
         database: url.pathname.slice(1),
       };
-      const normalizedCfg = this.normalizeSqlServerConfig(cfg);
+      const normalizedCfg = this.normalizeSqlServerConfig(cfg, type);
       return this.validateConnectionConfig(normalizedCfg, type);
     } catch (err) {
       throw new Error(`Invalid connection string: ${err.message}`);
     }
   }
+
   getDefaultPort(type) {
     return DEFAULT_PORTS[type] || DEFAULT_PORTS.mysql;
   }
 
-  // Normalize SQL Server configuration
-  normalizeSqlServerConfig(cfg) {
-    if (cfg.host) {
+  normalizeSqlServerConfig(cfg, type = "sqlserver") {
+    if (type === "sqlserver" && cfg.host) {
       cfg.server = cfg.host;
       delete cfg.host;
       cfg.options = { ...SQLSERVER_OPTIONS };
@@ -103,7 +138,6 @@ export default class MultiDatabaseMCPServer {
     return cfg;
   }
 
-  // Validate connection configuration
   validateConnectionConfig(cfg, type) {
     if (!cfg) {
       throw new Error("Connection config không được để trống");
@@ -123,7 +157,6 @@ export default class MultiDatabaseMCPServer {
       );
     }
 
-    // Validate SQL Server specific options
     if (type === "sqlserver" && cfg.options) {
       const validOptions = [
         "encrypt",
@@ -143,12 +176,8 @@ export default class MultiDatabaseMCPServer {
     return cfg;
   }
 
-  // Parse multiple database connections from environment variables
-  parseMultipleConnections(type) {
+  parseConnectionStringEnv(type, connections, parseErrors) {
     const envPrefix = type.toUpperCase();
-    const connections = {};
-
-    // Method 1: Parse from CONNECTIONS env var (format: alias1=url1;alias2=url2)
     const connectionsEnv = process.env[`${envPrefix}_CONNECTIONS`];
     if (connectionsEnv) {
       const connStrings = connectionsEnv
@@ -164,15 +193,17 @@ export default class MultiDatabaseMCPServer {
               type
             );
           } catch (e) {
-            console.warn(
-              `[DB MCP] Invalid connection string for ${alias}: ${e.message}`
-            );
+            const errorMsg = `Invalid connection string for ${alias}: ${e.message}`;
+            console.error(`[DB MCP] ${errorMsg}`);
+            parseErrors.push(errorMsg);
           }
         }
       }
     }
+  }
 
-    // Method 2: Parse from numbered DB vars (DB1_HOST, DB1_DATABASE, etc.)
+  parseNumberedEnv(type, connections) {
+    const envPrefix = type.toUpperCase();
     let dbIndex = 1;
     while (true) {
       const alias = `db${dbIndex}`;
@@ -182,7 +213,6 @@ export default class MultiDatabaseMCPServer {
       const password = process.env[`${envPrefix}_DB${dbIndex}_PASSWORD`];
       const database = process.env[`${envPrefix}_DB${dbIndex}_DATABASE`];
 
-      // If no host found for this index, break
       if (!host) break;
 
       let cfg = {
@@ -193,47 +223,63 @@ export default class MultiDatabaseMCPServer {
         database,
       };
 
-      cfg = this.normalizeSqlServerConfig(cfg);
+      cfg = this.normalizeSqlServerConfig(cfg, type);
       cfg = this.validateConnectionConfig(cfg, type);
 
       connections[alias] = cfg;
       dbIndex++;
     }
+  }
 
-    // Method 3: Default single database (backward compatibility)
-    if (Object.keys(connections).length === 0) {
-      const host = process.env[`${envPrefix}_HOST`];
-      const port = process.env[`${envPrefix}_PORT`];
-      const user = process.env[`${envPrefix}_USER`];
-      const password = process.env[`${envPrefix}_PASSWORD`];
-      const database = process.env[`${envPrefix}_DATABASE`];
+  parseLegacyEnv(type, connections) {
+    if (Object.keys(connections).length > 0) return;
 
-      if (host || database) {
-        let cfg = {
-          host: host || "localhost",
-          port: parseInt(port) || this.getDefaultPort(type),
-          user: user || "root",
-          password: password || "",
-          database,
-        };
+    const envPrefix = type.toUpperCase();
+    const host = process.env[`${envPrefix}_HOST`];
+    const port = process.env[`${envPrefix}_PORT`];
+    const user = process.env[`${envPrefix}_USER`];
+    const password = process.env[`${envPrefix}_PASSWORD`];
+    const database = process.env[`${envPrefix}_DATABASE`];
 
-        cfg = this.normalizeSqlServerConfig(cfg);
-        cfg = this.validateConnectionConfig(cfg, type);
+    if (host || database) {
+      let cfg = {
+        host: host || "localhost",
+        port: parseInt(port) || this.getDefaultPort(type),
+        user: user || "root",
+        password: password || "",
+        database,
+      };
 
-        connections["default"] = cfg;
-      }
+      cfg = this.normalizeSqlServerConfig(cfg, type);
+      cfg = this.validateConnectionConfig(cfg, type);
+
+      connections["default"] = cfg;
+    }
+  }
+
+  parseMultipleConnections(type) {
+    const connections = {};
+    const parseErrors = [];
+
+    this.parseConnectionStringEnv(type, connections, parseErrors);
+    this.parseNumberedEnv(type, connections);
+    this.parseLegacyEnv(type, connections);
+
+    if (Object.keys(connections).length === 0 && parseErrors.length > 0) {
+      const errorMsg = `❌ Không có connection nào hợp lệ cho ${type.toUpperCase()}:\n${parseErrors
+        .map((err) => `• ${err}`)
+        .join("\n")}`;
+      throw new Error(errorMsg);
     }
 
     return connections;
   }
 
-  // Get available database aliases for a type
   getAvailableDatabases(type) {
     const connections = this.parseMultipleConnections(type);
     return Object.keys(connections);
   }
 
-  // Helper method to detect DML/DDL operations
   isDMLDDLQuery(query) {
     const normalizedQuery = query.trim().toUpperCase();
     const dmlDdlKeywords = [
@@ -252,19 +298,19 @@ export default class MultiDatabaseMCPServer {
       "ROLLBACK",
     ];
 
-    return dmlDdlKeywords.some(
-      (keyword) =>
-        normalizedQuery.startsWith(keyword + " ") ||
-        normalizedQuery.startsWith(keyword + "\n") ||
-        normalizedQuery.startsWith(keyword + "\t")
+    const pattern = new RegExp(
+      `(^|[;\\n\\r]+)\\s*(${dmlDdlKeywords.join("|")})\\b`,
+      "i"
     );
+
+    return pattern.test(normalizedQuery);
   }
 
-  // Create tool definition
-  createToolDefinition() {
-    return {
-      name: "db_query",
-      description: `Thực thi SQL query trên database.
+  createToolDefinitions() {
+    return [
+      {
+        name: "db_query",
+        description: `Thực thi SQL query trên database.
 
 🎯 HỖ TRỢ: MySQL, PostgreSQL, SQL Server
 🔥 ĐÃ SETUP SẴN: env vars có sẵn
@@ -274,35 +320,86 @@ export default class MultiDatabaseMCPServer {
 • Chỉ định databaseAlias: chọn database cụ thể từ env vars
 
 ⚠️  CẢNH BÁO: AI KHÔNG ĐƯỢC tự ý thực hiện DML/DDL (INSERT, UPDATE, DELETE, CREATE, ALTER, DROP, etc.) - cần xin phép người dùng trước!`,
-      inputSchema: {
-        type: "object",
-        properties: {
-          type: {
-            type: "string",
-            enum: ["mysql", "mariadb", "postgresql", "sqlserver"],
-            description: "Database type (BẮT BUỘC)",
+        inputSchema: {
+          type: "object",
+          properties: {
+            type: {
+              type: "string",
+              enum: ["mysql", "mariadb", "postgresql", "sqlserver"],
+              description: "Database type (BẮT BUỘC)",
+            },
+            query: {
+              type: "string",
+              description: "SQL query",
+            },
+            databaseAlias: {
+              type: "string",
+              description:
+                "Alias của database (optional). Để trống sẽ dùng database mặc định. Các alias có sẵn sẽ được liệt kê nếu không tìm thấy database.",
+            },
+            connection: {
+              type: "object",
+              description:
+                "Connection config override (optional - sẽ override env vars)",
+            },
           },
-          query: {
-            type: "string",
-            description: "SQL query",
-          },
-          databaseAlias: {
-            type: "string",
-            description:
-              "Alias của database (optional). Để trống sẽ dùng database mặc định. Các alias có sẵn sẽ được liệt kê nếu không tìm thấy database.",
-          },
-          connection: {
-            type: "object",
-            description:
-              "Connection config override (optional - sẽ override env vars)",
-          },
+          required: ["type", "query"],
         },
-        required: ["type", "query"],
       },
-    };
+      {
+        name: "db_list_tables",
+        description: "Liệt kê tất cả các bảng trong database.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            type: {
+              type: "string",
+              enum: ["mysql", "mariadb", "postgresql", "sqlserver"],
+              description: "Database type (BẮT BUỘC)",
+            },
+            databaseAlias: {
+              type: "string",
+              description: "Alias của database (optional)",
+            },
+            connection: {
+              type: "object",
+              description: "Connection config override (optional)",
+            },
+          },
+          required: ["type"],
+        },
+      },
+      {
+        name: "db_describe_table",
+        description:
+          "Xem cấu trúc chi tiết của bảng (cột, kiểu dữ liệu, index).",
+        inputSchema: {
+          type: "object",
+          properties: {
+            type: {
+              type: "string",
+              enum: ["mysql", "mariadb", "postgresql", "sqlserver"],
+              description: "Database type (BẮT BUỘC)",
+            },
+            tableName: {
+              type: "string",
+              description: "Tên bảng cần xem chi tiết",
+            },
+            databaseAlias: {
+              type: "string",
+              description: "Alias của database (optional)",
+            },
+            connection: {
+              type: "object",
+              description: "Connection config override (optional)",
+            },
+          },
+          required: ["type", "tableName"],
+        },
+      },
+    ];
   }
 
-  // Validate query request parameters
   validateQueryRequest(args) {
     const { type, query } = args;
     if (!type || !query) {
@@ -317,7 +414,18 @@ export default class MultiDatabaseMCPServer {
     return args;
   }
 
-  // Resolve which database connection to use
+  validateCommonRequest(args) {
+    const { type } = args;
+    if (!type) {
+      throw new Error("type bắt buộc");
+    }
+    const supportedTypes = ["mysql", "mariadb", "postgresql", "sqlserver"];
+    if (!supportedTypes.includes(type)) {
+      throw new Error(`Database type không được hỗ trợ: ${type}`);
+    }
+    return args;
+  }
+
   resolveDatabaseConnection(type, databaseAlias, connection) {
     const availableConnections = this.parseMultipleConnections(type);
     const availableAliases = Object.keys(availableConnections);
@@ -326,15 +434,12 @@ export default class MultiDatabaseMCPServer {
     let usedAlias;
 
     if (connection?.connectionString) {
-      // Override with connection string
       cfg = this.parseConnectionString(connection.connectionString, type);
       usedAlias = "custom_connection_string";
     } else if (databaseAlias && availableConnections[databaseAlias]) {
-      // Use specified database alias
       cfg = availableConnections[databaseAlias];
       usedAlias = databaseAlias;
     } else if (availableAliases.length > 0) {
-      // Use first available database if no alias specified or alias not found
       if (databaseAlias && !availableConnections[databaseAlias]) {
         const errorMsg = `❌ Database alias "${databaseAlias}" không tìm thấy.
 
@@ -352,7 +457,6 @@ ${availableAliases
         throw new Error(errorMsg);
       }
 
-      // Use default (first available)
       usedAlias = availableAliases[0];
       cfg = availableConnections[usedAlias];
     } else {
@@ -378,7 +482,6 @@ ${availableAliases
     return { cfg, usedAlias };
   }
 
-  // Apply connection overrides
   applyConnectionOverrides(cfg, type, connection) {
     if (!connection || connection.connectionString) {
       return cfg;
@@ -393,12 +496,78 @@ ${availableAliases
       database: connection.database || cfg.database,
     };
 
-    return this.normalizeSqlServerConfig(newCfg);
+    return this.normalizeSqlServerConfig(newCfg, type);
   }
 
-  // Execute database query and return result
+  // Utility: Sleep for retry delay
+  sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  // Check if error is retryable (connection-related)
+  isRetryableError(err) {
+    const retryablePatterns = [
+      /ECONNRESET/i,
+      /ECONNREFUSED/i,
+      /ETIMEDOUT/i,
+      /PROTOCOL_CONNECTION_LOST/i,
+      /connection.*lost/i,
+      /connection.*closed/i,
+      /connection.*terminated/i,
+      /Connection is not connected/i,
+      /Cannot enqueue Query after fatal error/i,
+      /Cannot enqueue Query after invoking quit/i,
+      /EPIPE/i,
+      /socket hang up/i,
+      /Client has encountered a connection error/i,
+    ];
+
+    const errorMessage = err.message || "";
+    const errorCode = err.code || "";
+
+    return retryablePatterns.some(
+      (pattern) => pattern.test(errorMessage) || pattern.test(errorCode)
+    );
+  }
+
+  // Execute with retry logic
+  async executeWithRetry(operation, type, cfg) {
+    let lastError;
+    let delay = RETRY_CONFIG.initialDelayMs;
+
+    for (let attempt = 1; attempt <= RETRY_CONFIG.maxRetries; attempt++) {
+      try {
+        return await operation();
+      } catch (err) {
+        lastError = err;
+
+        // Check if retryable
+        if (
+          !this.isRetryableError(err) ||
+          attempt === RETRY_CONFIG.maxRetries
+        ) {
+          throw err;
+        }
+
+        console.error(
+          `[DB MCP] Query failed (attempt ${attempt}/${RETRY_CONFIG.maxRetries}): ${err.message}. Retrying in ${delay}ms...`
+        );
+
+        // Remove cached connection to force reconnect
+        this.removeConnection(type, cfg);
+
+        await this.sleep(delay);
+        delay = Math.min(
+          delay * RETRY_CONFIG.backoffMultiplier,
+          RETRY_CONFIG.maxDelayMs
+        );
+      }
+    }
+
+    throw lastError;
+  }
+
   async executeDatabaseQuery(type, cfg, query) {
-    // Check for DML/DDL operations and warn
     if (this.isDMLDDLQuery(query)) {
       const warningMsg = `⚠️  DML/DDL DETECTED: ${query.trim().split("\n")[0]}
 
@@ -415,20 +584,46 @@ ${availableAliases
       /password\s*=\s*['"][^'"]*['"]/gi,
       "password='***'"
     );
-    console.log(
+    console.error(
       `[DB MCP] Executing ${type}: ${safeLog.slice(0, 200)}${
         safeLog.length > 200 ? "..." : ""
       }`
     );
 
     try {
-      const db = await this.getConnection(type, cfg);
-      const res = await db.query(query);
-      if (Array.isArray(res.results) && res.results.length === 0) {
+      const res = await this.executeWithRetry(
+        async () => {
+          const db = await this.getConnection(type, cfg);
+          return await db.query(query);
+        },
+        type,
+        cfg
+      );
+
+      if (!res || typeof res !== "object") {
         return {
-          content: [{ type: "text", text: "Query không trả về record nào" }],
+          content: [
+            {
+              type: "text",
+              text: "❌ Database driver trả về result không hợp lệ",
+            },
+          ],
+          isError: true,
         };
       }
+
+      if (Array.isArray(res.results) && res.results.length === 0) {
+        return {
+          content: [{ type: "text", text: "[]" }],
+        };
+      }
+
+      if (!Array.isArray(res.results)) {
+        return {
+          content: [{ type: "text", text: JSON.stringify(res, null, 2) }],
+        };
+      }
+
       return {
         content: [{ type: "text", text: JSON.stringify(res.results, null, 2) }],
       };
@@ -442,24 +637,76 @@ ${availableAliases
 
   setupToolHandlers() {
     this.server.setRequestHandler(ListToolsRequestSchema, async () => ({
-      tools: [this.createToolDefinition()],
+      tools: this.createToolDefinitions(),
     }));
 
     this.server.setRequestHandler(CallToolRequestSchema, async (req) => {
-      if (req.params.name !== "db_query") throw new Error("Tool không tồn tại");
-
       try {
-        const { type, query, databaseAlias, connection } =
-          this.validateQueryRequest(req.params.arguments);
+        const { name, arguments: args } = req.params;
 
-        const { cfg: baseCfg } = this.resolveDatabaseConnection(
-          type,
-          databaseAlias,
-          connection
-        );
-        const cfg = this.applyConnectionOverrides(baseCfg, type, connection);
+        if (name === "db_query") {
+          const { type, query, databaseAlias, connection } =
+            this.validateQueryRequest(args);
+          const { cfg: baseCfg } = this.resolveDatabaseConnection(
+            type,
+            databaseAlias,
+            connection
+          );
+          const cfg = this.applyConnectionOverrides(baseCfg, type, connection);
+          return await this.executeDatabaseQuery(type, cfg, query);
+        }
 
-        return await this.executeDatabaseQuery(type, cfg, query);
+        if (name === "db_list_tables") {
+          const { type, databaseAlias, connection } =
+            this.validateCommonRequest(args);
+          const { cfg: baseCfg } = this.resolveDatabaseConnection(
+            type,
+            databaseAlias,
+            connection
+          );
+          const cfg = this.applyConnectionOverrides(baseCfg, type, connection);
+
+          const tables = await this.executeWithRetry(
+            async () => {
+              const db = await this.getConnection(type, cfg);
+              return await db.listTables();
+            },
+            type,
+            cfg
+          );
+
+          return {
+            content: [{ type: "text", text: JSON.stringify(tables, null, 2) }],
+          };
+        }
+
+        if (name === "db_describe_table") {
+          const { type, tableName, databaseAlias, connection } =
+            this.validateCommonRequest(args);
+          if (!tableName) throw new Error("tableName bắt buộc");
+
+          const { cfg: baseCfg } = this.resolveDatabaseConnection(
+            type,
+            databaseAlias,
+            connection
+          );
+          const cfg = this.applyConnectionOverrides(baseCfg, type, connection);
+
+          const details = await this.executeWithRetry(
+            async () => {
+              const db = await this.getConnection(type, cfg);
+              return await db.describeTable(tableName);
+            },
+            type,
+            cfg
+          );
+
+          return {
+            content: [{ type: "text", text: JSON.stringify(details, null, 2) }],
+          };
+        }
+
+        throw new Error(`Tool không tồn tại: ${name}`);
       } catch (err) {
         return {
           content: [{ type: "text", text: `❌ ${err.message}` }],
@@ -470,11 +717,22 @@ ${availableAliases
   }
 
   async cleanup() {
-    await Promise.all([...this.connections.values()].map((c) => c.close()));
+    const closePromises = [...this.connections.values()].map(async (c) => {
+      try {
+        await c.close();
+      } catch (err) {
+        console.error("[DB MCP] Error closing connection:", err.message);
+      }
+    });
+    await Promise.allSettled(closePromises);
+    this.connections.clear();
   }
+
   async run() {
     const transport = new StdioServerTransport();
     await this.server.connect(transport);
-    console.error("[DB MCP] Multi-Database Server started");
+    console.error(
+      "[DB MCP] Multi-Database Server started (with connection pooling)"
+    );
   }
 }
