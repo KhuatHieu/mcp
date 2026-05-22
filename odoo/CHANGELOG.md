@@ -1,5 +1,11 @@
 # @unclecat/mcp-odoo
 
+## 0.0.2
+
+### Patch Changes
+
+- Merge pull request #3 from unclecatvn/master
+
 ## 0.0.1
 
 ### Patch Changes
