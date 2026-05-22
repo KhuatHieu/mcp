@@ -1,314 +1,236 @@
-# Multi-Database MCP Server
+# @unclecat/mcp-multi-db
 
-MCP Server hỗ trợ nhiều loại database: MySQL/MariaDB, PostgreSQL, và SQL Server.
+> MCP server for MySQL/MariaDB, PostgreSQL, and SQL Server — parameterized queries, per-alias safety modes, query timeouts, row caps.
 
-## 🎯 Tính năng
+[![CI](https://github.com/unclecatvn/mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/unclecatvn/mcp/actions/workflows/ci.yml)
+[![npm](https://img.shields.io/npm/v/@unclecat/mcp-multi-db.svg)](https://www.npmjs.com/package/@unclecat/mcp-multi-db)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 
-- **Multi-Database Support**: MySQL/MariaDB, PostgreSQL, SQL Server
-- **Multiple Database Instances**: Hỗ trợ nhiều database cùng loại với alias
-- **Flexible Connection**: Connection string hoặc individual parameters
-- **Environment Variables**: Hỗ trợ config qua env vars
-- **Error Handling**: Xử lý lỗi chi tiết theo từng database type
-- **Connection Pooling**: Tái sử dụng kết nối hiệu quả
+📖 Tiếng Việt: [README.vi.md](./README.vi.md) · 🛡️ [Security policy](../SECURITY.md)
 
-## 📦 Cài đặt
+## Features
 
-```bash
-pnpm install
-# hoặc
-npm install
-```
+- **Parameterized queries only** — eliminates SQL injection at the API layer.
+- **Per-alias modes** — `readonly` (default), `readwrite`, `readwrite+ddl`.
+- **Multi-database** — MySQL, MariaDB, PostgreSQL, SQL Server side by side.
+- **Metadata-aware tool descriptions** — alias `description` + `tablesHint` are injected into MCP tool schemas so the AI picks the right database instead of guessing.
+- Query timeouts, row caps with overflow detection, SSL/TLS (`disable`/`prefer`/`require`/`verify`), connection pooling, retries with exponential backoff, structured logging.
 
-## ⚙️ Cấu hình
-
-### Environment Variables
-
-#### Phương pháp 1: Multiple Databases với Connection Strings (Khuyến nghị)
+## Install
 
 ```bash
-# Nhiều database MySQL với alias
-MYSQL_CONNECTIONS="prod=mysql://user:pass@prod-host:3306/prod_db;dev=mysql://user:pass@dev-host:3306/dev_db;test=mysql://user:pass@localhost:3306/test_db"
-
-# Nhiều database PostgreSQL
-POSTGRESQL_CONNECTIONS="main=postgresql://user:pass@host1:5432/main_db;analytics=postgresql://user:pass@host2:5432/analytics_db"
-
-# Nhiều database SQL Server
-SQLSERVER_CONNECTIONS="primary=sqlserver://user:pass@server1:1433/primary_db;secondary=sqlserver://user:pass@server2:1433/secondary_db"
+npx @unclecat/mcp-multi-db
 ```
 
-#### Phương pháp 2: Multiple Databases với Individual Variables
+Requires **Node ≥ 20**.
 
-```bash
-# Database MySQL đầu tiên
-MYSQL_DB1_HOST=host1
-MYSQL_DB1_PORT=3306
-MYSQL_DB1_USER=user1
-MYSQL_DB1_PASSWORD=pass1
-MYSQL_DB1_DATABASE=db1
+---
 
-# Database MySQL thứ hai
-MYSQL_DB2_HOST=host2
-MYSQL_DB2_PORT=3306
-MYSQL_DB2_USER=user2
-MYSQL_DB2_PASSWORD=pass2
-MYSQL_DB2_DATABASE=db2
+## Quick start (recommended: JSON config)
 
-# Tương tự cho PostgreSQL và SQL Server
-POSTGRESQL_DB1_HOST=host1
-POSTGRESQL_DB1_DATABASE=db1
-# ...
-```
-
-#### Phương pháp 3: Single Database (Backward Compatibility)
-
-```bash
-# MySQL/MariaDB
-MYSQL_HOST=localhost
-MYSQL_PORT=3306
-MYSQL_USER=root
-MYSQL_PASSWORD=yourpassword
-MYSQL_DATABASE=mydatabase
-
-# PostgreSQL
-POSTGRESQL_HOST=localhost
-POSTGRESQL_PORT=5432
-POSTGRESQL_USER=postgres
-POSTGRESQL_PASSWORD=yourpassword
-POSTGRESQL_DATABASE=mydatabase
-
-# SQL Server
-SQLSERVER_SERVER=localhost
-SQLSERVER_PORT=1433
-SQLSERVER_USER=sa
-SQLSERVER_PASSWORD=yourpassword
-SQLSERVER_DATABASE=mydatabase
-```
-
-### Cursor MCP Configuration
-
-Thêm config vào file `~/.cursor/mcp.json`:
+Point the server at a single JSON file with `MCP_DB_CONFIG` (use an **absolute path** — the MCP process's working directory is set by the client):
 
 ```json
 {
   "mcpServers": {
-    "db": {
-      "command": "node",
-      "args": ["/path/to/your/db/index.js"],
-      "env": {
-        "MYSQL_HOST": "localhost",
-        "MYSQL_USER": "root",
-        "MYSQL_PASSWORD": "yourpassword",
-        "MYSQL_DATABASE": "mydatabase",
-
-        "POSTGRESQL_HOST": "localhost",
-        "POSTGRESQL_USER": "postgres",
-        "POSTGRESQL_PASSWORD": "yourpassword",
-        "POSTGRESQL_DATABASE": "mydatabase",
-
-        "SQLSERVER_SERVER": "localhost",
-        "SQLSERVER_USER": "sa",
-        "SQLSERVER_PASSWORD": "yourpassword",
-        "SQLSERVER_DATABASE": "mydatabase"
-      }
+    "multi-db": {
+      "command": "npx",
+      "args": ["-y", "@unclecat/mcp-multi-db"],
+      "env": { "MCP_DB_CONFIG": "/absolute/path/to/mcp-db.config.json" }
     }
   }
 }
 ```
 
-**Lưu ý:**
+`mcp-db.config.json`:
 
-- Thay `/path/to/your/db/index.js` bằng đường dẫn thực tế đến file index.js
-- Chỉ cần config env vars cho database types mà bạn sử dụng
-- Restart Cursor sau khi thay đổi config
-
-## 🚀 Sử dụng
-
-### Tool: `db_query`
-
-**Parameters:**
-
-- `type` (required): Loại database (`mysql`, `mariadb`, `postgresql`, `sqlserver`)
-- `query` (required): SQL query để thực thi
-- `databaseAlias` (optional): Alias của database để sử dụng (nếu có nhiều database được cấu hình)
-- `connection` (optional): Thông tin kết nối database (override env vars)
-
-### 📝 Ví dụ sử dụng
-
-#### 1. Sử dụng với Connection String
-
-```json
+```jsonc
 {
-  "type": "mysql",
-  "query": "SHOW DATABASES;",
-  "connection": {
-    "connectionString": "mysql://user:pass@localhost:3306/mydatabase"
+  "$schema": "https://unpkg.com/@unclecat/mcp-multi-db/schema/config.schema.json",
+  "defaultAlias": "prod",
+  "aliases": {
+    "prod": {
+      "type": "postgresql",
+      "url": "postgresql://ro:pw@host:5432/main",
+      "mode": "readonly",
+      "displayName": "Production",
+      "description": "Read-only mirror of production. Orders, customers, products.",
+      "tablesHint": ["orders", "customers", "products"]
+    },
+    "staging": {
+      "type": "mysql",
+      "host": "stg.example.com", "user": "app", "password": "pw", "database": "appdb",
+      "mode": "readwrite"
+    }
   }
 }
 ```
 
-#### 2. Sử dụng với Individual Parameters
+Startup log:
+
+```
+[info] event="loaded_aliases" source="config_file" count=2 \
+       aliases="prod(postgresql,readonly), staging(mysql,readwrite)" defaultAlias="prod"
+```
+
+> **Why JSON over env vars?** One block per alias instead of `DB_<ALIAS>_*` × 6+ variables, and you can attach `displayName`/`description`/`tablesHint` — those go into the AI's tool description so it routes queries to the right alias.
+
+Copy [`mcp-db.config.example.json`](./mcp-db.config.example.json) to start.
+
+---
+
+## Configuration reference
+
+### Required per alias
+
+| Field | What |
+|---|---|
+| `type` | `postgresql` \| `mysql` \| `mariadb` \| `sqlserver` |
+| `url` **or** `host` | Connection URL, OR explicit `host` (+ `port`, `user`, `password`, `database` as the driver needs) |
+
+Set both → explicit fields override the URL's components.
+
+### Optional per alias (all default-safe)
+
+| Field | Default | Hard cap |
+|---|---|---|
+| `mode` | `readonly` | — |
+| `ssl` | `prefer` | — |
+| `caCert` | — | — |
+| `timeoutMs` | `30000` | `600000` |
+| `maxRows` | `10000` | `1000000` |
+| `poolMax` | `5` | `100` |
+
+### Metadata (JSON only — drives AI routing)
+
+| Field | Effect |
+|---|---|
+| `displayName` | Short label next to the alias name in tool descriptions. |
+| `description` | One-line "what this DB is for". Goes into tool descriptions so the AI knows which alias to call. |
+| `tablesHint` | Likely table names — gives the AI a starting point. |
+| `defaultAlias` (top-level) | Hint shown in tool descriptions when the user doesn't name a DB. `databaseAlias` is still **required** at the schema level — this is a routing hint, not a server-side default. |
+
+At startup the server injects this metadata into every tool's description, and adds a JSON-Schema `enum` to `databaseAlias` listing loaded aliases — clients cannot pass an alias that doesn't exist.
+
+### Server-wide
+
+| Setting | Default | How to set |
+|---|---|---|
+| Log level | `info` | env: `MCP_DB_LOG_LEVEL=debug` &nbsp;**or**&nbsp; JSON: `"logLevel": "debug"` (top-level) |
+
+### Alias name rules
+
+| Source | Pattern | Example |
+|---|---|---|
+| JSON `aliases` key | `^[a-z][a-z0-9_]*$` *(lowercase)* | `prod`, `db1`, `analytics_2024` |
+| Env var `DB_<ALIAS>_*` | `^[A-Z][A-Z0-9_]*$` *(uppercase)* | `PROD`, `DB1`, `ANALYTICS_2024` |
+| Tool call `databaseAlias` | always lowercase | `"prod"` |
+
+---
+
+## Alternative: env-var configuration
+
+When `MCP_DB_CONFIG` is **not** set, the server falls back to `DB_<ALIAS>_*` env vars. Use this for a simple single-DB case or when the client can't reference a file path.
 
 ```json
-{
-  "type": "postgresql",
-  "query": "SELECT * FROM pg_tables;",
-  "connection": {
-    "host": "localhost",
-    "port": 5432,
-    "user": "postgres",
-    "password": "yourpassword",
-    "database": "mydatabase"
-  }
+"env": {
+  "DB_PROD_TYPE": "postgresql",
+  "DB_PROD_URL": "postgresql://user:pass@host:5432/dbname"
 }
 ```
 
-#### 3. Sử dụng với Environment Variables (Database mặc định)
+Field name mapping = SCREAMING_SNAKE_CASE of the JSON field. The full list: `DB_<ALIAS>_TYPE`, `_URL`, `_HOST`, `_PORT`, `_USER`, `_PASSWORD`, `_DATABASE`, `_MODE`, `_SSL`, `_CA_CERT`, `_TIMEOUT_MS`, `_MAX_ROWS`, `_POOL_MAX`. Env-var loader does **not** support metadata (`displayName`/`description`/`tablesHint`) — JSON-only.
 
-```json
-{
-  "type": "sqlserver",
-  "query": "SELECT * FROM sys.tables;"
-}
+**Loader priority (exclusive):**
+
+- `MCP_DB_CONFIG` set → JSON loader, `DB_*` env vars ignored entirely.
+- `MCP_DB_CONFIG` unset → env-var loader.
+- Both empty → server exits with code 1.
+
+See [.env.example](./.env.example) for the full env template.
+
+---
+
+## Security model
+
+Every alias has a **mode** gating which SQL operations are allowed:
+
+| Mode | Allows |
+|---|---|
+| `readonly` *(default)* | SELECT, EXPLAIN, DESCRIBE, SHOW, USE |
+| `readwrite` | + INSERT, UPDATE, DELETE, MERGE |
+| `readwrite+ddl` | + CREATE, DROP, ALTER, TRUNCATE, GRANT, REVOKE, RENAME |
+
+Default is `readonly` — writes are blocked unless you opt in. Unknown statement types are rejected even at `readwrite+ddl`. For multi-statement queries the strictest mode wins. Blocked operations return `DB_PERMISSION_DENIED` naming the exact setting to change.
+
+### Parameterized queries
+
+```js
+// Positional — params is an array
+{ databaseAlias: "prod", sql: "SELECT * FROM users WHERE id = ?", params: [42] }
+
+// Named — params is an object
+{ databaseAlias: "prod", sql: "SELECT * FROM users WHERE id = :id", params: { id: 42 } }
 ```
 
-#### 4. Sử dụng với Multiple Databases (chỉ định databaseAlias)
+The server translates placeholders to the dialect's native form (`$1`/`?`/`@p1`). Placeholders inside string literals and comments are ignored. Mismatched placeholder/param count throws a validation error.
 
-```json
-{
-  "type": "mysql",
-  "query": "SELECT * FROM users LIMIT 10;",
-  "databaseAlias": "prod"
-}
+### Row caps
+
+SELECT without `LIMIT`/`TOP`/`FETCH` is capped at `maxRows` (default 10 000). Response includes `truncated: true` when the cap is hit. Per-query override:
+
+```js
+db_query({ databaseAlias: "prod", sql: "SELECT * FROM big_table", maxRows: 50, timeoutMs: 5000 })
 ```
 
-#### 5. Override connection với individual parameters
+Override is bounded by alias config and the global hard caps (1 000 000 rows, 600 000 ms).
 
-```json
-{
-  "type": "postgresql",
-  "query": "SELECT * FROM analytics_data;",
-  "databaseAlias": "analytics",
-  "connection": {
-    "password": "override_password"
-  }
-}
-```
+---
 
-## 🔧 Database-Specific Commands
+## Tools
 
-### MySQL/MariaDB
+Tool descriptions are rebuilt at startup to embed the loaded alias roster — so the AI sees what each DB is for, not just a list of names.
 
-```sql
--- Hiển thị databases
-SHOW DATABASES;
+| Tool | Inputs | Description |
+|---|---|---|
+| `db_query` | `databaseAlias`, `sql`, `params?`, `maxRows?`, `timeoutMs?` | Execute parameterized SQL. |
+| `db_list_tables` | `databaseAlias`, `schema?` | List tables (optionally schema-filtered). |
+| `db_describe_table` | `databaseAlias`, `tableName`, `schema?` | Columns + indexes for one table. |
+| `db_test_connection` | `databaseAlias` | Lightweight `SELECT 1` healthcheck. |
+| `db_query_history` | `databaseAlias?`, `limit?` | Recent in-memory query metadata (last 50, no SQL text). |
+| `db_explain_query` | `databaseAlias`, `sql`, `params?` | Dialect-specific EXPLAIN. |
 
--- Chọn database
-USE mydatabase;
+## Resources
 
--- Hiển thị tables
-SHOW TABLES;
+- `db://aliases` — JSON summary of loaded aliases. Includes `displayName`/`description`/`tablesHint` when set. No secrets.
+- `db://security-guide` — Markdown reference for modes + parameterized queries.
 
--- Describe table
-DESCRIBE table_name;
-```
+---
 
-### PostgreSQL
+## Troubleshooting
 
-```sql
--- Hiển thị databases
-SELECT datname FROM pg_database;
+| Code / event | Meaning | Fix |
+|---|---|---|
+| `DB_PERMISSION_DENIED` | Operation not permitted by alias mode | Raise `mode` in JSON (or `DB_<ALIAS>_MODE` env). |
+| `DB_TIMEOUT` | Query exceeded timeout | Raise alias `timeoutMs` or pass per-request `timeoutMs`. |
+| `DB_RESULT_TOO_LARGE` | Row cap exceeded | Add `LIMIT`, or raise `maxRows`. |
+| `DB_CONNECTION_FAILED` | Cannot reach DB | Verify host/port/credentials. Server retries 3× with backoff. |
+| `DB_VALIDATION_FAILED` | Bad identifier | `databaseAlias` / `tableName` / `schema` must match `^[A-Za-z_][A-Za-z0-9_]*$`. |
+| `DB_CONFIG_INVALID` | Bad env-var alias config | Message names the field + valid values. Other aliases still load. |
+| `Config file not readable at '...'` | `MCP_DB_CONFIG` path missing or unreadable | Use an **absolute** path; check file permissions. |
+| `Config file is not valid JSON: ...` | JSON syntax error | Validate the file (editors flag this when `$schema` is set). |
+| `Config schema error: aliases.<a>.<field>: ...` | JSON field invalid | Message names field + reason; fix or remove that alias entry. |
+| `defaultAlias '...' does not reference a loaded alias` | Top-level `defaultAlias` typo | Match an existing key under `aliases`. Server still starts; hint just ignored. |
+| `event="no_valid_aliases"` (exit 1) | No alias loaded | Set at least one alias in JSON or env. |
 
--- Hiển thị tables
-SELECT * FROM information_schema.tables;
+Verify what loaded: read the startup log (`event="loaded_aliases" source="..." count=..."`) or the `db://aliases` resource.
 
--- Describe table
-\d table_name
--- hoặc
-SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'table_name';
-```
+---
 
-### SQL Server
+## Contributing
 
-```sql
--- Hiển thị databases
-SELECT name FROM sys.databases;
+See [CONTRIBUTING.md](../CONTRIBUTING.md) at the monorepo root.
 
--- Sử dụng database
-USE [mydatabase];
+## License
 
--- Hiển thị tables
-SELECT * FROM sys.tables;
-
--- Describe table
-SELECT COLUMN_NAME, DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = 'table_name';
-```
-
-## 🎯 Connection String Format
-
-- **MySQL**: `mysql://user:pass@host:port/database`
-- **MariaDB**: `mariadb://user:pass@host:port/database`
-- **PostgreSQL**: `postgresql://user:pass@host:port/database`
-- **SQL Server**: `sqlserver://user:pass@host:port/database`
-
-## 🚨 Lưu ý quan trọng
-
-1. **USE Statement**: Chỉ áp dụng cho MySQL/MariaDB
-2. **SQL Syntax**: Mỗi database có syntax khác nhau
-3. **Connection Security**: Luôn sử dụng strong passwords và secure connections
-4. **Error Handling**: Server sẽ trả về lỗi chi tiết theo từng database type
-
-## 🔍 Troubleshooting
-
-### MySQL/MariaDB
-
-- `ER_NO_DB_ERROR`: Sử dụng `USE database_name;` hoặc specify database trong connection
-- `ER_BAD_DB_ERROR`: Database không tồn tại, kiểm tra với `SHOW DATABASES;`
-
-### PostgreSQL
-
-- `3D000`: Database không tồn tại
-- `42P01`: Table không tồn tại
-
-### SQL Server
-
-- `Invalid object name`: Object không tồn tại, kiểm tra với `SELECT * FROM sys.tables;`
-
-## 📊 Response Format
-
-### SELECT Queries
-
-```json
-{
-  "type": "select",
-  "databaseType": "mysql",
-  "host": "localhost",
-  "port": 3306,
-  "database": "mydatabase",
-  "rowCount": 10,
-  "data": [...],
-  "fields": [...]
-}
-```
-
-### Modification Queries
-
-```json
-{
-  "type": "modification",
-  "databaseType": "postgresql",
-  "host": "localhost",
-  "port": 5432,
-  "database": "mydatabase",
-  "affectedRows": 1,
-  "insertId": null,
-  "message": "Query executed successfully"
-}
-```
-
-## 🏃 Chạy Server
-
-```bash
-pnpm start
-# hoặc
-node index.js
-```
+MIT — see [LICENSE](./LICENSE).

@@ -1,0 +1,121 @@
+name: Release
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch: # escape hatch: maintainer can trigger publish manually
+
+concurrency:
+  group: release-${{ github.ref }}
+
+jobs:
+  release:
+    name: Release packages
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      id-token: write # Required for npm Trusted Publishers (OIDC)
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history needed for changeset diff detection
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24 # ships with npm 11.x — needed for Trusted Publishers OIDC
+          cache: pnpm
+
+      - name: Ensure npm ≥ 11.5.1 (Trusted Publishers OIDC)
+        run: |
+          current=$(npm --version)
+          echo "Current npm: $current"
+          needed="11.5.1"
+          if printf '%s\n%s\n' "$needed" "$current" | sort -V | head -n1 | grep -qx "$needed"; then
+            echo "npm $current is recent enough — no upgrade needed"
+          else
+            echo "Upgrading npm to latest (using --force to bypass self-update bug)…"
+            npm install -g npm@latest --force
+            echo "npm now at: $(npm --version)"
+          fi
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Quality gate (all packages)
+        run: |
+          pnpm -r lint
+          pnpm -r format
+          pnpm -r test
+          pnpm audit --audit-level=high
+
+      - name: Auto-generate changeset for packages with code changes
+        run: |
+          set -euo pipefail
+
+          last_subject="$(git log -1 --pretty=%s)"
+
+          # Skip the squash-merge case: HEAD is the version-bump commit itself.
+          if [[ "$last_subject" == "chore(release): version packages" ]]; then
+            echo "Version bump commit — skipping auto-generation"
+            exit 0
+          fi
+
+          # Skip the merge-commit case: HEAD merged the changeset-release/* branch
+          # (GitHub default subject: "Merge pull request #N from <owner>/changeset-release/<branch>").
+          # Without this, every Version Packages PR merge spawns another changeset → infinite loop.
+          if [[ "$last_subject" == *"changeset-release/"* ]]; then
+            echo "Merge of Version Packages PR — skipping auto-generation"
+            exit 0
+          fi
+
+          # Skip if any pending changeset already exists (manual or prior auto)
+          if find .changeset -maxdepth 1 -name '*.md' ! -name 'README.md' | grep -q .; then
+            echo "Pending changeset(s) found — skipping auto-generation"
+            exit 0
+          fi
+
+          # Detect changed workspace packages between this commit and its first parent
+          base=$(git rev-parse HEAD^1)
+          changed_dirs=$(git diff --name-only "$base" HEAD \
+            | awk -F/ '$1=="db" || $1=="odoo" {print $1}' \
+            | sort -u)
+
+          if [ -z "$changed_dirs" ]; then
+            echo "No workspace package files changed — no release this run"
+            exit 0
+          fi
+
+          short_sha=$(git rev-parse --short HEAD)
+          summary=$(git log -1 --pretty=%s)
+          file=".changeset/auto-${short_sha}.md"
+
+          {
+            echo "---"
+            for dir in $changed_dirs; do
+              pkg_name=$(node -p "require('./${dir}/package.json').name")
+              echo "\"${pkg_name}\": patch"
+            done
+            echo "---"
+            echo ""
+            echo "$summary"
+          } > "$file"
+
+          echo "=== Generated $file ==="
+          cat "$file"
+
+      - id: changesets
+        uses: changesets/action@v1
+        with:
+          publish: pnpm release
+          createGithubReleases: true
+          commit: "chore(release): version packages"
+          title: "chore(release): version packages"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # No NPM_TOKEN / NODE_AUTH_TOKEN — npm Trusted Publishers uses OIDC.
+          NPM_CONFIG_PROVENANCE: "true"
+
+      # "Version Packages" PR is merged manually by maintainer.
+      # The Release workflow runs again on that merge commit and publishes.
